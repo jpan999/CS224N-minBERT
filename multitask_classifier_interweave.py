@@ -61,14 +61,14 @@ class MultitaskBERT(nn.Module):
         self.cos = nn.CosineSimilarity(dim=1, eps=1e-6)
 
 
-    def forward(self, input_ids, attention_mask, task_id=0):
+    def forward(self, input_ids, attention_mask):
         'Takes a batch of sentences and produces embeddings for them.'
         # The final BERT embedding is the hidden state of [CLS] token (the first token)
         # Here, you can start by just returning the embeddings straight from BERT.
         # When thinking of improvements, you can later try modifying this
         # (e.g., by adding other layers).
         ### TODO
-        pooled_output = self.bert(input_ids=input_ids, attention_mask=attention_mask, task_id=task_id)['pooler_output']
+        pooled_output = self.bert(input_ids=input_ids, attention_mask=attention_mask)['pooler_output']
         return pooled_output
 
 
@@ -79,7 +79,7 @@ class MultitaskBERT(nn.Module):
         Thus, your output should contain 5 logits for each sentence.
         '''
         ### TODO
-        pooled_output = self.forward(input_ids, attention_mask, 0)
+        pooled_output = self.forward(input_ids, attention_mask)
         pooled_output = self.dropout(pooled_output)
         out = self.linear_sent(pooled_output)
         return out
@@ -93,10 +93,10 @@ class MultitaskBERT(nn.Module):
         during evaluation, and handled as a logit by the appropriate loss function.
         '''
         ### TODO
-        pooled_output1 = self.forward(input_ids_1, attention_mask_1, 1)
+        pooled_output1 = self.forward(input_ids_1, attention_mask_1)
         pooled_output1 = self.dropout(pooled_output1)
         pooled_output1 = self.linear_para1(pooled_output1)
-        pooled_output2 = self.forward(input_ids_2, attention_mask_2, 1)
+        pooled_output2 = self.forward(input_ids_2, attention_mask_2)
         pooled_output2 = self.dropout(pooled_output2)
         pooled_output2 = self.linear_para2(pooled_output2)
         cos_dist = torch.diagonal(torch.mm(pooled_output1, pooled_output2.t()))
@@ -113,10 +113,10 @@ class MultitaskBERT(nn.Module):
         '''
         # Update: it is no longer passed to sigmoid in evaluation.py
         ### TODO
-        pooled_output1 = self.forward(input_ids_1, attention_mask_1, 2)
+        pooled_output1 = self.forward(input_ids_1, attention_mask_1)
         pooled_output1 = self.dropout(pooled_output1)
         pooled_output1 = self.linear_sim1(pooled_output1)
-        pooled_output2 = self.forward(input_ids_2, attention_mask_2, 2)
+        pooled_output2 = self.forward(input_ids_2, attention_mask_2)
         pooled_output2 = self.dropout(pooled_output2)
         pooled_output2 = self.linear_sim2(pooled_output2)
         cos_dist = torch.diagonal(torch.mm(pooled_output1, pooled_output2.t()))
@@ -186,18 +186,24 @@ def train_multitask(args):
     model = model.to(device)
 
     lr = args.lr
-    weight_decay = args.weight_decay
-    optimizer = AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
+    optimizer = AdamW(model.parameters(), lr=lr)
     best_dev_acc = 0
 
     # Run for the specified number of epochs
     for epoch in range(args.epochs):
         model.train()
         
-        # train on SST
         train_loss_sst = 0
+        train_loss_para = 0
+        train_loss_sts = 0
         num_batches = 0
-        for batch in tqdm(sst_train_dataloader, desc=f'train-{epoch}', disable=TQDM_DISABLE):
+        for batch_sst, batch_para, batch_sts in zip(tqdm(sst_train_dataloader, desc=f'train-{epoch}', disable=TQDM_DISABLE)
+            , tqdm(para_train_dataloader, desc=f'train-{epoch}', disable=TQDM_DISABLE)
+            , tqdm(sts_train_dataloader, desc=f'train-{epoch}', disable=TQDM_DISABLE)):
+
+            # train on SST
+            # print('SST batch')
+            batch = batch_sst
             b_ids, b_mask, b_labels = (batch['token_ids'],
                                        batch['attention_mask'], batch['labels'])
 
@@ -205,22 +211,14 @@ def train_multitask(args):
             b_mask = b_mask.to(device)
             b_labels = b_labels.to(device)
 
-            optimizer.zero_grad()
             logits = model.predict_sentiment(b_ids, b_mask)
-            loss = F.cross_entropy(logits, b_labels.view(-1), reduction='sum') / args.batch_size
-            loss.backward()
-            optimizer.step()
+            loss1 = F.cross_entropy(logits, b_labels.view(-1), reduction='sum') / args.batch_size
 
-            train_loss_sst += loss.item()
-            num_batches += 1
+            train_loss_sst += loss1.item()
 
-        train_loss_sst = train_loss_sst / (num_batches)
-        print(f"Epoch {epoch}: SST train loss :: {train_loss_sst :.3f}")
-
-        # train on Para
-        train_loss_para = 0
-        num_batches = 0
-        for batch in tqdm(para_train_dataloader, desc=f'train-{epoch}', disable=TQDM_DISABLE):
+            # train on Para
+            # print('Para batch')
+            batch = batch_para
             (b_ids1, b_mask1,
              b_ids2, b_mask2,
              b_labels, b_sent_ids) = (batch['token_ids_1'], batch['attention_mask_1'],
@@ -235,21 +233,13 @@ def train_multitask(args):
 
             optimizer.zero_grad()
             logits = model.predict_paraphrase(b_ids1, b_mask1, b_ids2, b_mask2)
-            loss = F.binary_cross_entropy_with_logits(logits, b_labels.view(-1).float(), reduction='sum') / args.batch_size
+            loss2 = F.binary_cross_entropy_with_logits(logits, b_labels.view(-1).float(), reduction='sum') / args.batch_size
 
-            loss.backward()
-            optimizer.step()
+            train_loss_para += loss2.item()
 
-            train_loss_para += loss.item()
-            num_batches += 1
-
-        train_loss_para = train_loss_para / (num_batches)
-        print(f"Epoch {epoch}: Para train loss :: {train_loss_para :.3f}")
-
-        # train on STS
-        train_loss_sts = 0
-        num_batches = 0
-        for batch in tqdm(sts_train_dataloader, desc=f'train-{epoch}', disable=TQDM_DISABLE):
+            # train on STS
+            # print('STS batch')
+            batch = batch_sts
             (b_ids1, b_mask1,
              b_ids2, b_mask2,
              b_labels, b_sent_ids) = (batch['token_ids_1'], batch['attention_mask_1'],
@@ -264,19 +254,24 @@ def train_multitask(args):
 
             optimizer.zero_grad()
             logits = model.predict_similarity(b_ids1, b_mask1, b_ids2, b_mask2)
-            loss = F.mse_loss(logits, b_labels.view(-1).float(), reduction='sum') / args.batch_size
+            loss3 = F.mse_loss(logits, b_labels.view(-1).float(), reduction='sum') / args.batch_size
 
-            loss.backward()
+            train_loss_sts += loss3.item()
+
+            optimizer.zero_grad() 
+            total_loss = loss1 + loss2 + loss3
+            total_loss.backward()
             optimizer.step()
-
-            train_loss_sts += loss.item()
             num_batches += 1
 
+        train_loss_sst = train_loss_sst / (num_batches)
+        train_loss_para = train_loss_para / (num_batches)
         train_loss_sts = train_loss_sts / (num_batches)
-        print(f"Epoch {epoch}: STS train loss :: {train_loss_sts :.3f}")
+        print(f"Epoch {epoch}: SST: train loss :: {train_loss_sst :.3f}\n" +
+            f"Para train loss :: {train_loss_para :.3f}\n" +
+            f"STS train loss :: {train_loss_sts :.3f}")
 
         # Print progress and save best model
-        print(f"Epoch {epoch}")
         print("Train eval:")
         train_paraphrase_accuracy, _, _, train_sentiment_accuracy, _, _, train_sts_corr, _, _ = model_eval_multitask(sst_train_dataloader, para_train_dataloader, sts_train_dataloader, model, device)
         print("Dev eval:")
@@ -341,8 +336,7 @@ def get_args():
     parser.add_argument("--hidden_dropout_prob", type=float, default=0.3)
     parser.add_argument("--lr", type=float, help="learning rate, default lr for 'pretrain': 1e-3, 'finetune': 1e-5",
                         default=1e-5)
-    parser.add_argument("--weight_decay", type=float, default=0.0)
-
+    
     # pal and lowrank extension
     parser.add_argument("--extension_option", type=str, choices=('none', 'pal', 'lowrank'), default="none")
     
